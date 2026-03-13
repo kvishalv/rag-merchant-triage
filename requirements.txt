@@ -1,0 +1,28 @@
+# ─── Core LangChain stack ─────────────────────────────────────────────────────
+langchain==0.3.7
+langchain-core==0.3.19
+langchain-community==0.3.7
+langchain-openai==0.2.9
+langgraph==0.2.53
+
+# ─── Vector store ─────────────────────────────────────────────────────────────
+chromadb==0.5.20
+
+# ─── OpenAI ───────────────────────────────────────────────────────────────────
+openai==1.55.3
+
+# ─── LangSmith evaluation ─────────────────────────────────────────────────────
+langsmith==0.1.147
+
+# ─── Data validation ─────────────────────────────────────────────────────────
+pydantic==2.9.2
+
+# ─── Environment ─────────────────────────────────────────────────────────────
+python-dotenv==1.0.1
+
+# ─── Utilities ───────────────────────────────────────────────────────────────
+# tiktoken is used by LangChain's text splitters to count tokens accurately
+tiktoken==0.8.0
+
+# typing-extensions required for TypedDict annotations used in LangGraph state
+typing-extensions==4.12.2
