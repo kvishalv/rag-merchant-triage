@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "merchant-triage"
+version = "0.1.0"
+description = "RAG-based merchant issue triage system"
+requires-python = ">=3.11"
+readme = "README.md"
+
+dependencies = [
+    "langchain>=1.2,<2.0",
+    "langchain-core>=1.2,<2.0",
+    "langchain-community>=0.4,<1.0",
+    "langchain-openai>=1.1,<2.0",
+    "langchain-text-splitters>=1.1,<2.0",
+    "langgraph>=1.1,<2.0",
+    "chromadb>=1.5,<2.0",
+    "openai>=2.0,<3.0",
+    "langsmith>=0.7,<1.0",
+    "pydantic>=2.9,<3.0",
+    "python-dotenv>=1.0,<2.0",
+    "tiktoken>=0.8,<1.0",
+    "typing-extensions>=4.12,<5.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+# ---------------------------------------------------------------------------
+# After cloning, run:
+#   pip install -e .
+#
+# This installs the `src` package in editable mode so you can run:
+#   python -m src.ingest
+#   python -m src.triage_agent
+#   python -m src.evaluate
+#
+# Or import from anywhere in the project:
+#   from src.triage_agent import run_triage
+#   from src.retriever import load_vector_store, search
+# ---------------------------------------------------------------------------
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+select = ["E", "F", "I", "UP"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"

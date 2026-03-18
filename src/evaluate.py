@@ -5,24 +5,26 @@ LangSmith evaluation suite for the merchant issue triage system.
 
 Runs two categories of evaluations:
   1. Retrieval relevance — does the retriever surface the correct past cases
-     for a given query? Scored with a custom LLM-as-judge evaluator.
+     for a given query? Scored with a recall@k metric.
   2. Triage response quality — does the triage agent produce accurate,
-     grounded, and actionable structured outputs? Scored across four
-     dimensions: root cause accuracy, component accuracy, recommendation
-     quality, and confidence calibration.
+     grounded, and actionable structured outputs? Scored across three
+     dimensions: component accuracy, root cause quality (LLM-as-judge),
+     and escalation accuracy.
 
-All results are logged to LangSmith for comparison across runs. Evaluation
-datasets are maintained as code here (golden_dataset) to keep them version-
-controlled alongside the system they test.
+All results are logged to LangSmith for comparison across runs. The golden
+dataset is maintained as code here so it's version-controlled alongside the
+system it tests — a new incident pattern added to fixtures must have a
+corresponding golden example added here.
 
 Usage:
-    python src/evaluate.py
-    python src/evaluate.py --eval retrieval      # retrieval eval only
-    python src/evaluate.py --eval triage         # triage eval only
-    python src/evaluate.py --dataset-name my_ds  # push dataset to LangSmith
+    python -m src.evaluate
+    python -m src.evaluate --eval retrieval
+    python -m src.evaluate --eval triage
+    python -m src.evaluate --push-dataset       # push golden dataset to LangSmith first
 """
 
 import argparse
+import json
 import logging
 import os
 from typing import Optional
@@ -34,26 +36,36 @@ from langsmith import Client
 from langsmith.evaluation import evaluate as ls_evaluate
 from langsmith.schemas import Example, Run
 
-from retriever import (
+from .config import (
+    DEFAULT_K,
+    JUDGE_MODEL,
+    JUDGE_TEMPERATURE,
+    LANGSMITH_DATASET_NAME,
+    LANGSMITH_RETRIEVAL_EXPERIMENT_PREFIX,
+    LANGSMITH_TRIAGE_EXPERIMENT_PREFIX,
+    TRIAGE_MODEL,
+)
+from .retriever import (
     deduplicate_results,
     format_results_for_context,
     load_vector_store,
     search,
 )
-from triage_agent import TriageResponse, run_triage
+from .triage_agent import TriageResponse, run_triage
 
 load_dotenv()
 logger = logging.getLogger(__name__)
 
+
 # ---------------------------------------------------------------------------
 # Golden dataset
 # ---------------------------------------------------------------------------
-# Each entry defines an input (the query a support engineer would type)
-# and the expected output (ground truth for eval scoring).
+# Each entry defines an input (the query a support engineer would type) and
+# the expected output (ground truth for eval scoring).
 #
-# This dataset is deliberately small (9 entries) and hand-curated against
-# the fixture data in data/fixtures/merchant_issues.json. In production,
-# this was grown iteratively as new incident patterns were confirmed.
+# Deliberately small (9 entries) and hand-curated against the fixture data.
+# In production, this was grown iteratively as new incident patterns were
+# confirmed by senior engineers and added to the eval set.
 
 GOLDEN_DATASET: list[dict] = [
     {
@@ -217,19 +229,18 @@ GOLDEN_DATASET: list[dict] = [
 # ---------------------------------------------------------------------------
 
 def push_dataset_to_langsmith(
-    dataset_name: str = "merchant-triage-golden",
+    dataset_name: str = LANGSMITH_DATASET_NAME,
     client: Optional[Client] = None,
 ) -> str:
     """
     Create or update a LangSmith dataset from the golden dataset.
 
     Returns the dataset ID. Safe to call repeatedly — existing examples
-    are matched by their 'id' field and updated if changed.
+    are matched and updated if changed.
     """
     if client is None:
         client = Client()
 
-    # Create dataset if it doesn't exist
     existing_datasets = {ds.name: ds for ds in client.list_datasets()}
     if dataset_name in existing_datasets:
         dataset = existing_datasets[dataset_name]
@@ -241,7 +252,6 @@ def push_dataset_to_langsmith(
         )
         logger.info("Created LangSmith dataset: %s (id=%s)", dataset_name, dataset.id)
 
-    # Upsert examples
     for entry in GOLDEN_DATASET:
         client.create_example(
             inputs=entry["input"],
@@ -267,20 +277,17 @@ def retrieval_relevance_evaluator(run: Run, example: Example) -> dict:
       0.5 — at least one expected issue ID appears in the top-k results
       0.0 — none of the expected issue IDs appear
 
-    This is a recall-focused metric. Precision is handled separately by the
-    triage response quality evaluator (which checks for hallucinated citations).
+    Recall-focused: we care that the right cases are present in the context
+    passed to the LLM, not that irrelevant ones are absent.
     """
     vector_store = load_vector_store()
-    query = example.inputs["issue_description"]
-    severity = example.inputs.get("severity")
-    merchant_tier = example.inputs.get("merchant_tier")
-
+    inputs = example.inputs
     results = search(
         vector_store=vector_store,
-        query=query,
-        k=6,
-        severity=severity,
-        merchant_tier=merchant_tier,
+        query=inputs["issue_description"],
+        k=DEFAULT_K,
+        severity=inputs.get("severity"),
+        merchant_tier=inputs.get("merchant_tier"),
     )
     deduped = deduplicate_results(results)
     retrieved_ids = {r.issue_id for r in deduped}
@@ -297,10 +304,7 @@ def retrieval_relevance_evaluator(run: Run, example: Example) -> dict:
     return {
         "key": "retrieval_recall",
         "score": score,
-        "comment": (
-            f"Expected {expected_ids}, retrieved {retrieved_ids}. "
-            f"Hits: {hits}"
-        ),
+        "comment": f"Expected {expected_ids}, retrieved {retrieved_ids}. Hits: {hits}",
     }
 
 
@@ -308,16 +312,15 @@ def component_accuracy_evaluator(run: Run, example: Example) -> dict:
     """
     Evaluates whether the triage agent correctly identifies the affected component.
 
-    Binary score: 1.0 if correct, 0.0 if wrong.
-    Component accuracy is the most reliable signal for triage quality because
-    it's objective and maps directly to on-call routing.
+    Binary: 1.0 if correct, 0.0 if wrong. Component accuracy is the most
+    reliable signal for triage quality because it's objective and maps
+    directly to on-call routing decisions.
     """
     output = run.outputs or {}
     triage = output.get("triage_response")
     if not triage:
         return {"key": "component_accuracy", "score": 0.0, "comment": "No triage response."}
 
-    # Handle both dict and TriageResponse object
     component = triage.get("affected_component") if isinstance(triage, dict) else triage.affected_component
     expected = example.outputs.get("affected_component", "")
 
@@ -333,9 +336,9 @@ def root_cause_quality_evaluator(run: Run, example: Example) -> dict:
     """
     LLM-as-judge evaluator for root cause quality.
 
-    Uses GPT-4o to assess whether the predicted root cause contains the
-    expected keywords and is grounded in the retrieved cases rather than
-    hallucinated. Returns a score from 0.0 to 1.0.
+    Uses the judge model (GPT-4o, temp=0) to assess whether the predicted
+    root cause contains the expected keywords and is grounded in the retrieved
+    cases rather than hallucinated.
 
     This is the most expensive evaluator (~1 LLM call per example) but
     provides the richest signal for prompt engineering iteration.
@@ -348,7 +351,7 @@ def root_cause_quality_evaluator(run: Run, example: Example) -> dict:
     root_cause = triage.get("likely_root_cause") if isinstance(triage, dict) else triage.likely_root_cause
     expected_keywords = example.outputs.get("root_cause_keywords", [])
 
-    judge_llm = ChatOpenAI(model="gpt-4o", temperature=0)
+    judge_llm = ChatOpenAI(model=JUDGE_MODEL, temperature=JUDGE_TEMPERATURE)
 
     judge_prompt = ChatPromptTemplate.from_messages([
         (
@@ -359,7 +362,7 @@ def root_cause_quality_evaluator(run: Run, example: Example) -> dict:
             "0.7 — Correct direction but missing specificity or key details.\n"
             "0.4 — Partially correct but with misleading or generic elements.\n"
             "0.0 — Wrong, hallucinated, or completely off-base.\n\n"
-            "Respond with JSON: {{\"score\": <float>, \"reason\": \"<one sentence>\"}}",
+            'Respond with JSON: {{"score": <float>, "reason": "<one sentence>"}}',
         ),
         (
             "human",
@@ -375,7 +378,6 @@ def root_cause_quality_evaluator(run: Run, example: Example) -> dict:
         "keywords": ", ".join(expected_keywords),
     })
 
-    import json
     try:
         result = json.loads(response.content)
         score = float(result.get("score", 0.0))
@@ -391,9 +393,9 @@ def escalation_accuracy_evaluator(run: Run, example: Example) -> dict:
     """
     Evaluates whether the agent correctly determines if escalation is warranted.
 
-    Binary score: 1.0 if escalation_recommended matches ground truth, 0.0 otherwise.
-    False negatives (not escalating a P0-severity issue) are weighted higher in
-    production, but this evaluator keeps it simple for the demo.
+    Binary: 1.0 if escalation_recommended matches ground truth, 0.0 otherwise.
+    In production, false negatives (missing a real P0) are weighted higher than
+    false positives, but this evaluator keeps it symmetric for simplicity.
     """
     output = run.outputs or {}
     triage = output.get("triage_response")
@@ -416,12 +418,12 @@ def escalation_accuracy_evaluator(run: Run, example: Example) -> dict:
 # ---------------------------------------------------------------------------
 
 def retrieval_target(inputs: dict) -> dict:
-    """Wrap the retriever for LangSmith evaluation."""
+    """Wraps the retriever for LangSmith evaluation."""
     vector_store = load_vector_store()
     results = search(
         vector_store=vector_store,
         query=inputs["issue_description"],
-        k=6,
+        k=DEFAULT_K,
         severity=inputs.get("severity"),
         merchant_tier=inputs.get("merchant_tier"),
     )
@@ -433,7 +435,7 @@ def retrieval_target(inputs: dict) -> dict:
 
 
 def triage_target(inputs: dict) -> dict:
-    """Wrap the triage agent for LangSmith evaluation."""
+    """Wraps the triage agent for LangSmith evaluation."""
     result = run_triage(
         issue_description=inputs["issue_description"],
         severity=inputs.get("severity"),
@@ -447,8 +449,8 @@ def triage_target(inputs: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 def run_retrieval_eval(
-    dataset_name: str = "merchant-triage-golden",
-    experiment_prefix: str = "retrieval",
+    dataset_name: str = LANGSMITH_DATASET_NAME,
+    experiment_prefix: str = LANGSMITH_RETRIEVAL_EXPERIMENT_PREFIX,
 ) -> None:
     """Run the retrieval evaluation suite against the LangSmith dataset."""
     logger.info("Starting retrieval evaluation against dataset '%s'.", dataset_name)
@@ -457,15 +459,15 @@ def run_retrieval_eval(
         data=dataset_name,
         evaluators=[retrieval_relevance_evaluator],
         experiment_prefix=experiment_prefix,
-        metadata={"evaluator": "retrieval_recall", "k": 6},
+        metadata={"evaluator": "retrieval_recall", "k": DEFAULT_K},
     )
     logger.info("Retrieval eval complete. View results in LangSmith.")
     return results
 
 
 def run_triage_eval(
-    dataset_name: str = "merchant-triage-golden",
-    experiment_prefix: str = "triage",
+    dataset_name: str = LANGSMITH_DATASET_NAME,
+    experiment_prefix: str = LANGSMITH_TRIAGE_EXPERIMENT_PREFIX,
 ) -> None:
     """Run the full triage response quality evaluation suite."""
     logger.info("Starting triage quality evaluation against dataset '%s'.", dataset_name)
@@ -479,7 +481,7 @@ def run_triage_eval(
         ],
         experiment_prefix=experiment_prefix,
         metadata={
-            "model": "gpt-4o",
+            "model": TRIAGE_MODEL,
             "evaluators": ["component_accuracy", "root_cause_quality", "escalation_accuracy"],
         },
     )
@@ -491,7 +493,7 @@ def run_triage_eval(
 # CLI entry point
 # ---------------------------------------------------------------------------
 
-def parse_args() -> argparse.Namespace:
+def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run LangSmith evaluations for the merchant triage system."
     )
@@ -499,13 +501,13 @@ def parse_args() -> argparse.Namespace:
         "--eval",
         choices=["retrieval", "triage", "all"],
         default="all",
-        help="Which evaluation to run.",
+        help="Which evaluation to run (default: all).",
     )
     parser.add_argument(
         "--dataset-name",
         type=str,
-        default="merchant-triage-golden",
-        help="LangSmith dataset name to use (will be created if not exists).",
+        default=LANGSMITH_DATASET_NAME,
+        help="LangSmith dataset name (created if it doesn't exist).",
     )
     parser.add_argument(
         "--push-dataset",
@@ -521,9 +523,8 @@ if __name__ == "__main__":
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
-    args = parse_args()
+    args = _parse_args()
 
-    # Validate LangSmith credentials
     if not os.environ.get("LANGCHAIN_API_KEY"):
         raise EnvironmentError(
             "LANGCHAIN_API_KEY not set. Copy .env.example to .env and populate it."

@@ -9,9 +9,9 @@ Run this once to populate the vector store before using retriever.py
 or triage_agent.py.
 
 Usage:
-    python src/ingest.py
-    python src/ingest.py --fixtures data/fixtures/merchant_issues.json
-    python src/ingest.py --reset  # wipe and re-ingest
+    python -m src.ingest
+    python -m src.ingest --fixtures data/fixtures/merchant_issues.json
+    python -m src.ingest --reset   # wipe and re-ingest
 """
 
 import argparse
@@ -22,10 +22,21 @@ from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
 from langchain_core.documents import Document
 from langchain_openai import OpenAIEmbeddings
+
+from .config import (
+    CHUNK_OVERLAP,
+    CHUNK_SEPARATORS,
+    CHUNK_SIZE,
+    CHROMA_PERSIST_DIR,
+    COLLECTION_NAME,
+    EMBEDDING_MODEL,
+    FIXTURES_PATH,
+    REQUIRED_ISSUE_FIELDS,
+)
 
 load_dotenv()
 
@@ -34,20 +45,6 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-FIXTURES_PATH = Path(__file__).parent.parent / "data" / "fixtures" / "merchant_issues.json"
-CHROMA_PERSIST_DIR = Path(__file__).parent.parent / ".chroma_db"
-COLLECTION_NAME = "merchant_issues"
-
-# Chunk size is tuned so each chunk captures a full issue segment (description
-# + root_cause) without splitting mid-sentence. Overlap ensures context isn't
-# lost at boundaries, which matters for retrieval coherence.
-CHUNK_SIZE = 800
-CHUNK_OVERLAP = 120
 
 
 # ---------------------------------------------------------------------------
@@ -59,11 +56,11 @@ def build_document_text(issue: dict[str, Any]) -> str:
     Construct the text representation of an issue that will be embedded.
 
     We deliberately concatenate the fields that carry the most diagnostic
-    signal: title, description, root_cause, and resolution. Metadata (severity,
-    merchant_tier, component, tags) is stored separately as filterable fields
-    on the Chroma document — not embedded — so that retrieval can be both
-    semantic AND metadata-filtered without polluting the embedding space with
-    categorical tokens.
+    signal: title, description, root_cause, and resolution. Metadata
+    (severity, merchant_tier, component, tags) is stored separately as
+    filterable fields on the Chroma document — not embedded — so that
+    retrieval can be both semantic AND metadata-filtered without polluting
+    the embedding space with categorical tokens.
     """
     sections = [
         f"Issue: {issue['title']}",
@@ -80,9 +77,13 @@ def build_metadata(issue: dict[str, Any]) -> dict[str, Any]:
 
     All values must be scalar (str, int, float, bool) for ChromaDB
     compatibility — lists are serialized to comma-separated strings.
+
+    Note: 'title' is stored here so RetrievalResult can surface it
+    without re-parsing the full document text.
     """
     return {
         "issue_id": issue["issue_id"],
+        "title": issue["title"],           # stored for display; not for embedding
         "severity": issue["severity"],
         "merchant_tier": issue["merchant_tier"],
         "component": issue["component"],
@@ -94,7 +95,7 @@ def build_metadata(issue: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def load_issues(fixtures_path: Path) -> list[dict[str, Any]]:
+def load_issues(fixtures_path: Path = FIXTURES_PATH) -> list[dict[str, Any]]:
     """Load and validate the raw issue fixture JSON."""
     if not fixtures_path.exists():
         raise FileNotFoundError(f"Fixtures file not found: {fixtures_path}")
@@ -102,12 +103,12 @@ def load_issues(fixtures_path: Path) -> list[dict[str, Any]]:
     with open(fixtures_path, "r", encoding="utf-8") as f:
         issues = json.load(f)
 
-    required_fields = {"issue_id", "severity", "merchant_tier", "component",
-                       "title", "description", "root_cause", "resolution"}
     for issue in issues:
-        missing = required_fields - set(issue.keys())
+        missing = REQUIRED_ISSUE_FIELDS - set(issue.keys())
         if missing:
-            raise ValueError(f"Issue {issue.get('issue_id', '?')} missing fields: {missing}")
+            raise ValueError(
+                f"Issue {issue.get('issue_id', '?')} missing required fields: {missing}"
+            )
 
     logger.info("Loaded %d issues from %s", len(issues), fixtures_path)
     return issues
@@ -128,7 +129,7 @@ def issues_to_documents(issues: list[dict[str, Any]]) -> list[Document]:
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
-        separators=["\n\n", "\n", ". ", " "],  # prefer splitting at paragraph/sentence
+        separators=CHUNK_SEPARATORS,
     )
 
     raw_docs: list[Document] = []
@@ -163,9 +164,8 @@ def get_embedding_model() -> OpenAIEmbeddings:
     """
     Instantiate the OpenAI embeddings model.
 
-    text-embedding-3-small is used here as the default. It offers a strong
-    price/performance trade-off for retrieval use cases and produces 1536-dim
-    vectors. Swap to text-embedding-3-large for higher accuracy at ~6x cost.
+    Uses EMBEDDING_MODEL from config (default: text-embedding-3-small).
+    Swap to text-embedding-3-large in .env for higher accuracy at ~6x cost.
     """
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
@@ -173,7 +173,7 @@ def get_embedding_model() -> OpenAIEmbeddings:
             "OPENAI_API_KEY not set. Copy .env.example to .env and populate it."
         )
     return OpenAIEmbeddings(
-        model="text-embedding-3-small",
+        model=EMBEDDING_MODEL,
         openai_api_key=api_key,
     )
 
@@ -185,7 +185,7 @@ def ingest(
     reset: bool = False,
 ) -> Chroma:
     """
-    Full ingest pipeline: load → chunk → embed → store.
+    Full ingest pipeline: load → validate → chunk → embed → store.
 
     Args:
         fixtures_path: Path to the merchant issues JSON fixture file.
@@ -203,7 +203,6 @@ def ingest(
     persist_dir.mkdir(parents=True, exist_ok=True)
 
     if reset:
-        # Wipe the existing collection so we start clean
         import chromadb
         client = chromadb.PersistentClient(path=str(persist_dir))
         try:
@@ -234,8 +233,10 @@ def ingest(
 # CLI entry point
 # ---------------------------------------------------------------------------
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Ingest merchant issue documents into ChromaDB.")
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Ingest merchant issue documents into ChromaDB."
+    )
     parser.add_argument(
         "--fixtures",
         type=Path,
@@ -263,7 +264,7 @@ def parse_args() -> argparse.Namespace:
 
 
 if __name__ == "__main__":
-    args = parse_args()
+    args = _parse_args()
     ingest(
         fixtures_path=args.fixtures,
         persist_dir=args.persist_dir,

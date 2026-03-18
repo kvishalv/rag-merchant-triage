@@ -18,15 +18,15 @@ Architecture:
   - LangSmith tracing is enabled automatically via LANGCHAIN_API_KEY env var
 
 Usage:
-    from src.triage_agent import run_triage
+    python -m src.triage_agent
 
-    result = run_triage(
-        issue_description="Customers on iOS 17 are seeing a blank screen at checkout.",
-        severity="P1",
-        merchant_tier="enterprise",
-    )
-    print(result.likely_root_cause)
-    print(result.recommended_action)
+    Or from another module:
+        from src.triage_agent import run_triage
+        result = run_triage(
+            issue_description="EUR transactions are all failing with 500.",
+            severity="P0",
+            merchant_tier="enterprise",
+        )
 """
 
 import logging
@@ -36,16 +36,21 @@ from typing import Annotated, Optional
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.output_parsers import JsonOutputParser
-from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel, Field
 from typing_extensions import TypedDict
 
-from retriever import (
+from .config import (
+    DEFAULT_K,
+    MAX_CONTEXT_ISSUES,
+    MIN_FILTERED_RESULTS,
+    TRIAGE_MODEL,
+    TRIAGE_TEMPERATURE,
+)
+from .retriever import (
     RetrievalResult,
-    build_where_filter,
     deduplicate_results,
     format_results_for_context,
     load_vector_store,
@@ -63,7 +68,9 @@ logger = logging.getLogger(__name__)
 class SupportingCase(BaseModel):
     """A past case cited as evidence for the triage decision."""
     issue_id: str = Field(description="Issue ID from the knowledge base.")
-    relevance_note: str = Field(description="One sentence explaining why this case is relevant.")
+    relevance_note: str = Field(
+        description="One sentence explaining why this case is relevant to the incoming issue."
+    )
 
 
 class TriageResponse(BaseModel):
@@ -74,37 +81,53 @@ class TriageResponse(BaseModel):
     Jira custom fields) so the response can be auto-populated on ticket creation.
     """
     likely_root_cause: str = Field(
-        description="Concise hypothesis for the most probable root cause, "
-                    "grounded in the retrieved similar cases."
+        description=(
+            "Concise hypothesis for the most probable root cause, "
+            "grounded in the retrieved similar cases."
+        )
     )
     affected_component: str = Field(
-        description="The platform component most likely at fault. "
-                    "One of: payment_processing, webhooks, subscription_billing, "
-                    "payout, fraud_risk, other."
+        description=(
+            "The platform component most likely at fault. "
+            "One of: payment_processing, webhooks, subscription_billing, "
+            "payout, fraud_risk, other."
+        )
     )
     recommended_action: str = Field(
-        description="Specific, actionable next step for the on-call engineer. "
-                    "Should name a concrete artifact (config, job, service) to inspect."
+        description=(
+            "Specific, actionable next step for the on-call engineer. "
+            "Should name a concrete artifact (config, job, service) to inspect."
+        )
     )
     confidence_score: float = Field(
         ge=0.0,
         le=1.0,
-        description="Confidence in the triage (0.0–1.0). Reflects how closely "
-                    "the retrieved cases match the incoming issue. <0.5 means "
-                    "the issue is novel and manual investigation is needed.",
+        description=(
+            "Confidence in the triage (0.0–1.0). Reflects how closely "
+            "the retrieved cases match the incoming issue. <0.5 means "
+            "the issue is novel and manual investigation is needed."
+        ),
     )
     escalation_recommended: bool = Field(
-        description="True if the issue pattern matches prior P0/P1 incidents "
-                    "with high affected transaction counts."
+        description=(
+            "True if the issue pattern matches prior P0/P1 incidents "
+            "with high affected transaction counts."
+        )
     )
     supporting_cases: list[SupportingCase] = Field(
-        description="Past cases from the knowledge base that informed this triage.",
+        description=(
+            "Past cases from the knowledge base that informed this triage. "
+            "Only cite cases that are genuinely relevant."
+        ),
         max_items=4,
     )
     caveats: Optional[str] = Field(
         default=None,
-        description="Any important caveats, e.g., if the issue description is "
-                    "too vague or if the retrieved cases are only loosely related."
+        description=(
+            "Important caveats — e.g., if the issue description is too vague, "
+            "if retrieved cases are only loosely related, or if the issue "
+            "appears to be genuinely novel."
+        ),
     )
 
 
@@ -117,8 +140,8 @@ class TriageState(TypedDict):
     State passed between nodes in the LangGraph graph.
 
     Using TypedDict keeps the state contract explicit — each node declares
-    exactly what fields it reads and writes, which makes the graph easier
-    to test and trace in LangSmith.
+    exactly what fields it reads and writes, making the graph easy to test
+    and inspect in LangSmith traces.
     """
     # Inputs (set by the caller before graph invocation)
     issue_description: str
@@ -133,7 +156,7 @@ class TriageState(TypedDict):
     # Populated by the `triage` node
     triage_response: Optional[TriageResponse]
 
-    # Message history (used for LangSmith tracing; not currently multi-turn)
+    # Message history (used for LangSmith tracing)
     messages: Annotated[list, add_messages]
 
 
@@ -154,7 +177,7 @@ Guidelines:
 - confidence_score: 0.8+ means strong pattern match. 0.5–0.8 means plausible hypothesis. <0.5 means novel — say so.
 - escalation_recommended: Set to true if the issue resembles a prior P0/P1 with >500 affected transactions.
 - supporting_cases: Only cite cases that are genuinely relevant. 2–3 strong references beats 5 weak ones.
-- caveats: Be honest about gaps. If the issue description is vague, note it.
+- caveats: Be honest about gaps. If the issue description is vague or no cases match well, note it.
 
 Respond ONLY with valid JSON matching the TriageResponse schema. No prose before or after the JSON."""
 
@@ -186,23 +209,24 @@ def retrieve_node(state: TriageState) -> dict:
     Node 1: Retrieve semantically similar past cases from the vector store.
 
     Applies any available metadata filters from the incoming issue state
-    before running the similarity search. Deduplicates results by issue_id
-    so the LLM context contains distinct cases, not repeated chunks.
+    before running the similarity search. Falls back to unfiltered search
+    if filtered results are sparse (< MIN_FILTERED_RESULTS). Deduplicates
+    results by issue_id so the LLM context contains distinct cases.
     """
     vector_store = load_vector_store()
 
+    # Fetch more than we need; dedup and truncation happen after
     results = search(
         vector_store=vector_store,
         query=state["issue_description"],
-        k=8,  # retrieve more than we need; dedup will trim it
+        k=DEFAULT_K + 2,
         severity=state.get("severity"),
         merchant_tier=state.get("merchant_tier"),
         component=state.get("component_hint"),
     )
 
-    # If filtered search returns < 3 results, fall back to unfiltered search
-    # to avoid starving the LLM of context on narrow queries
-    if len(results) < 3:
+    # Fall back to unfiltered search if filters are too narrow
+    if len(results) < MIN_FILTERED_RESULTS:
         logger.info(
             "Filtered retrieval returned %d results; falling back to unfiltered search.",
             len(results),
@@ -210,16 +234,16 @@ def retrieve_node(state: TriageState) -> dict:
         unfiltered = search(
             vector_store=vector_store,
             query=state["issue_description"],
-            k=6,
+            k=DEFAULT_K,
         )
+        # Merge: filtered results first, then unfiltered (dedup handles overlap)
         results = results + unfiltered
 
     deduped = deduplicate_results(results)
-    # Cap at top-5 unique issues for context
-    top_cases = deduped[:5]
+    top_cases = deduped[:MAX_CONTEXT_ISSUES]
     context = format_results_for_context(top_cases)
 
-    logger.info("Retrieved %d unique cases for triage.", len(top_cases))
+    logger.info("Retrieved %d unique cases for triage context.", len(top_cases))
 
     return {
         "retrieved_cases": top_cases,
@@ -232,25 +256,23 @@ def triage_node(state: TriageState) -> dict:
     """
     Node 2: Run the LLM triage chain over the retrieved context.
 
-    Uses LCEL (LangChain Expression Language) composition:
-        prompt | llm | json_parser
+    LCEL chain composition:
+        [SystemMessage, HumanMessage] → ChatOpenAI → JsonOutputParser → TriageResponse
 
-    The JsonOutputParser handles the structured output extraction. In
-    production we use with_structured_output() on gpt-4o directly, but
-    the manual parser approach here makes the prompt engineering more
-    transparent and allows custom fallback logic.
+    The JsonOutputParser handles structured output extraction. Temperature is
+    kept at 0.1 to minimize hallucination of root causes not supported by
+    the retrieved cases.
     """
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         raise EnvironmentError("OPENAI_API_KEY not set.")
 
     llm = ChatOpenAI(
-        model="gpt-4o",
-        temperature=0.1,  # low temp for consistent, grounded responses
+        model=TRIAGE_MODEL,
+        temperature=TRIAGE_TEMPERATURE,
         openai_api_key=api_key,
     )
 
-    # Build the prompt
     user_content = USER_PROMPT_TEMPLATE.format(
         issue_description=state["issue_description"],
         severity=state.get("severity") or "not specified",
@@ -264,13 +286,9 @@ def triage_node(state: TriageState) -> dict:
         HumanMessage(content=user_content),
     ]
 
-    # LCEL chain: llm → JSON parser → Pydantic model
     json_parser = JsonOutputParser(pydantic_object=TriageResponse)
-
     response = llm.invoke(messages)
     raw_json = json_parser.parse(response.content)
-
-    # Construct the TriageResponse from the parsed dict
     triage_response = TriageResponse(**raw_json)
 
     logger.info(
@@ -285,8 +303,9 @@ def triage_node(state: TriageState) -> dict:
         "messages": [
             HumanMessage(
                 content=(
-                    f"Triage result: {triage_response.affected_component} "
-                    f"(confidence={triage_response.confidence_score:.2f})"
+                    f"Triage: {triage_response.affected_component} "
+                    f"(confidence={triage_response.confidence_score:.2f}, "
+                    f"escalate={triage_response.escalation_recommended})"
                 )
             )
         ],
@@ -304,7 +323,7 @@ def build_triage_graph() -> StateGraph:
     The graph is intentionally simple (linear: retrieve → triage → END)
     but structured as a graph to make it easy to extend — e.g., adding a
     human-in-the-loop confirmation node for P0 escalations, or a parallel
-    node that queries an external incident management API.
+    enrichment node that queries an external incident management API.
     """
     graph = StateGraph(TriageState)
 
@@ -344,7 +363,7 @@ def run_triage(
 
     Raises:
         EnvironmentError: If OPENAI_API_KEY is not set.
-        RuntimeError: If the vector store is empty (run ingest.py first).
+        RuntimeError: If the vector store is empty (run `make ingest` first).
     """
     app = build_triage_graph()
 
@@ -364,18 +383,23 @@ def run_triage(
 
 
 # ---------------------------------------------------------------------------
-# CLI entry point for quick manual testing
+# CLI entry point
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     import json
+    import logging
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
 
     test_issue = (
         "Enterprise merchant is seeing a spike in payment declines starting about 20 minutes ago. "
         "Customers are getting generic 'card declined' errors on Visa and Mastercard. "
         "The merchant's own metrics show ~40% of checkout attempts failing. "
-        "No code was deployed on our side in the last 6 hours. "
-        "Issue appears to be across all card types."
+        "No code was deployed on our side in the last 6 hours."
     )
 
     result = run_triage(

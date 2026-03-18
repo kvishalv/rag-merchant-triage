@@ -13,10 +13,12 @@ This module is consumed directly by triage_agent.py but can also be used
 standalone for exploratory retrieval during debugging or eval set construction.
 
 Usage:
-    from src.retriever import build_retriever, search
+    python -m src.retriever  (runs a demo query against the loaded vector store)
 
-    retriever = build_retriever()
-    results = search(retriever, "payment failures on Visa cards", severity="P0")
+    Or from another module:
+        from src.retriever import load_vector_store, search
+        vs = load_vector_store()
+        results = search(vs, "Visa card declines on checkout", severity="P0")
 """
 
 import logging
@@ -30,24 +32,19 @@ from langchain_community.vectorstores import Chroma
 from langchain_core.documents import Document
 from langchain_openai import OpenAIEmbeddings
 
-from ingest import CHROMA_PERSIST_DIR, COLLECTION_NAME
+from .config import (
+    CHROMA_PERSIST_DIR,
+    COLLECTION_NAME,
+    DEFAULT_K,
+    EMBEDDING_MODEL,
+    MAX_CONTEXT_ISSUES,
+    MIN_FILTERED_RESULTS,
+    MMR_FETCH_K,
+    MMR_LAMBDA,
+)
 
 load_dotenv()
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-
-# Default number of documents to retrieve per query. In production this
-# was tuned to k=6 — enough context for the LLM to reason across multiple
-# similar past cases without blowing the context window.
-DEFAULT_K = 6
-
-# Fetch fetch_k candidates then re-rank with MMR when diversity mode is on.
-# Higher fetch_k increases result diversity at the cost of latency.
-MMR_FETCH_K = 20
-MMR_LAMBDA = 0.6  # 0 = max diversity, 1 = max relevance; 0.6 balances both
 
 
 # ---------------------------------------------------------------------------
@@ -60,8 +57,9 @@ class RetrievalResult:
     A single retrieved issue with its similarity score and parsed metadata.
 
     score is the cosine similarity (0–1, higher = more similar). Note that
-    ChromaDB returns distance (lower = more similar) internally; we invert
-    it here so callers always work with a consistent "higher is better" score.
+    ChromaDB returns distance (lower = more similar) internally; the
+    similarity_search_with_relevance_scores API inverts this so callers
+    always work with a consistent "higher is better" score.
     """
     issue_id: str
     title: str
@@ -81,7 +79,7 @@ class RetrievalResult:
         tags = [t.strip() for t in tags_raw.split(",") if t.strip()] if tags_raw else []
         return cls(
             issue_id=meta.get("issue_id", "unknown"),
-            title=meta.get("title", ""),
+            title=meta.get("title", ""),       # populated since ingest.py now stores title
             component=meta.get("component", ""),
             severity=meta.get("severity", ""),
             merchant_tier=meta.get("merchant_tier", ""),
@@ -114,11 +112,11 @@ def load_vector_store(
     if not persist_dir.exists():
         raise FileNotFoundError(
             f"ChromaDB persistence directory not found at {persist_dir}. "
-            "Run `python src/ingest.py` to populate the vector store first."
+            "Run `make ingest` to populate the vector store first."
         )
 
     embeddings = OpenAIEmbeddings(
-        model="text-embedding-3-small",
+        model=EMBEDDING_MODEL,
         openai_api_key=api_key,
     )
 
@@ -128,12 +126,11 @@ def load_vector_store(
         persist_directory=str(persist_dir),
     )
 
-    # Verify the collection isn't empty — a common footgun after a reset
     count = vector_store._collection.count()
     if count == 0:
         raise RuntimeError(
             f"Collection '{collection_name}' is empty. "
-            "Run `python src/ingest.py` to ingest documents."
+            "Run `make ingest` to ingest documents."
         )
 
     logger.info("Loaded collection '%s' with %d vectors.", collection_name, count)
@@ -231,7 +228,6 @@ def search(
             RetrievalResult.from_document(doc, score=score)
             for doc, score in docs_and_scores
         ]
-        # Sort highest relevance first
         results.sort(key=lambda r: r.score, reverse=True)
 
     logger.info(
@@ -248,17 +244,18 @@ def search(
 def deduplicate_results(results: list[RetrievalResult]) -> list[RetrievalResult]:
     """
     Remove duplicate issue_ids from retrieval results, keeping the highest-
-    scoring chunk per issue. This is necessary because a single issue can
-    produce multiple chunks, all of which may rank highly for a given query.
+    scoring chunk per issue.
 
-    The triage agent works best with distinct cases, not repeated chunks
-    from the same issue.
+    This is necessary because a single issue can produce multiple chunks, all
+    of which may rank highly for a given query. The triage agent works best
+    with distinct cases, not repeated chunks from the same issue.
     """
     seen: dict[str, RetrievalResult] = {}
     for result in results:
         if result.issue_id not in seen or result.score > seen[result.issue_id].score:
             seen[result.issue_id] = result
-    return list(seen.values())
+    # Preserve descending score order
+    return sorted(seen.values(), key=lambda r: r.score, reverse=True)
 
 
 def format_results_for_context(results: list[RetrievalResult]) -> str:
@@ -267,7 +264,7 @@ def format_results_for_context(results: list[RetrievalResult]) -> str:
     into the LLM prompt as few-shot context.
 
     Format is intentionally verbose enough for the LLM to reason about root
-    causes and resolutions, while staying within ~3k tokens for k=6 results.
+    causes and resolutions, while staying within ~3k tokens for k=5 results.
     """
     if not results:
         return "No relevant past cases found."
@@ -302,10 +299,6 @@ def build_retriever(
     Returns a Chroma retriever configured with the given metadata filters and k.
     This object is compatible with LangChain LCEL (|) composition, so it can
     be dropped directly into a RunnableSequence as the retrieval step.
-
-    The returned retriever uses similarity search (not MMR) by default, which
-    is preferred for the triage agent since precision matters more than diversity
-    when we're trying to match an incoming issue to its most likely root cause.
     """
     vector_store = load_vector_store(persist_dir, collection_name)
     where_filter = build_where_filter(severity, merchant_tier, component)
@@ -318,3 +311,25 @@ def build_retriever(
         search_type="similarity",
         search_kwargs=search_kwargs,
     )
+
+
+# ---------------------------------------------------------------------------
+# CLI / demo mode
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import sys
+
+    query = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else (
+        "payments failing with high decline rate, no recent deploy"
+    )
+    print(f"\nQuery: {query}\n")
+
+    vs = load_vector_store()
+    results = search(vs, query, k=5)
+    deduped = deduplicate_results(results)
+
+    for r in deduped:
+        print(f"[{r.score:.3f}] {r.issue_id} — {r.severity} — {r.component}")
+        print(f"  {r.title}")
+        print()
